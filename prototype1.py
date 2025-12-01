@@ -1,6 +1,5 @@
 from dotenv import load_dotenv
 load_dotenv()
-
 import os
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -9,8 +8,6 @@ import json
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Required OpenRouter headers
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
     "HTTP-Referer": "http://localhost",
@@ -20,120 +17,89 @@ HEADERS = {
 
 mcp = FastMCP()
 
-# -------------------------------
-# TOOL 1 — Grok
-# -------------------------------
 @mcp.tool()
-async def call_grok(prompt: str) -> str:
-    """
-    Call Grok model via OpenRouter.
-    """
+async def call_grok(prompt: str, system: str = None) -> str:
     data = {
         "model": "x-ai/grok-4.1-fast:free",
         "messages": [{"role": "user", "content": prompt}]
     }
-
-    async with httpx.AsyncClient() as client:
+    if system:
+        data["messages"].insert(0, {"role": "system", "content": system})
+    async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(URL, headers=HEADERS, json=data)
         return json.dumps(r.json())
 
-# -------------------------------
-# TOOL 2 — Mistral
-# -------------------------------
 @mcp.tool()
-async def call_mistral(prompt: str) -> str:
-    """
-    Call Mistral model via OpenRouter.
-    """
+async def call_mistral(prompt: str, system: str = None) -> str:
     data = {
         "model": "mistralai/mistral-small-3.1-24b-instruct:free",
         "messages": [{"role": "user", "content": prompt}]
     }
-
-    async with httpx.AsyncClient() as client:
+    if system:
+        data["messages"].insert(0, {"role": "system", "content": system})
+    async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(URL, headers=HEADERS, json=data)
         return json.dumps(r.json())
 
-# -------------------------------
-# TOOL 3 — Debate Engine
-# -------------------------------
 @mcp.tool()
 async def debate_llm(prompt: str) -> str:
-    """
-    Debate between Grok and Mistral and produce a final synthesized answer.
-
-    Args:
-        prompt (str): The topic or question to debate.
-    Returns:
-        str: Debate transcript and final conclusion.
-    """
-    rounds = 3
-    grok_claim = prompt
-    mistral_claim = prompt
-
-    grok_text = ""
-    mistral_text = ""
-
-    for _ in range(rounds):
-
+    rounds = 4
+    
+    grok_system = "You are a critical thinker focused on first principles, evidence, and challenging assumptions. Be concise but thorough."
+    mistral_system = "You are an analytical thinker focused on practical implications, counterarguments, and real-world constraints. Be concise but thorough."
+    
+    debate_history = []
+    
+    grok_prompt = f"Analyze this question from your perspective:\n{prompt}"
+    mistral_prompt = f"Analyze this question from your perspective:\n{prompt}"
+    
+    for i in range(rounds):
         grok_resp_str, mistral_resp_str = await asyncio.gather(
-            call_grok(grok_claim),
-            call_mistral(mistral_claim)
+            call_grok(grok_prompt, grok_system),
+            call_mistral(mistral_prompt, mistral_system)
         )
-
+        
         grok_resp = json.loads(grok_resp_str)
         mistral_resp = json.loads(mistral_resp_str)
-
-        # If request failed, return error details instead of crashing
+        
         if "choices" not in grok_resp:
-            return f"Grok API error:\n{grok_resp}"
-
+            return f"Grok API error: {grok_resp}"
         if "choices" not in mistral_resp:
-            return f"Mistral API error:\n{mistral_resp}"
-
+            return f"Mistral API error: {mistral_resp}"
+        
         grok_text = grok_resp["choices"][0]["message"]["content"]
         mistral_text = mistral_resp["choices"][0]["message"]["content"]
+        
+        debate_history.append(f"Round {i+1} - Grok: {grok_text}")
+        debate_history.append(f"Round {i+1} - Mistral: {mistral_text}")
+        
+        grok_prompt = f"Mistral responded:\n{mistral_text}\n\nAddress their points and strengthen your argument:"
+        mistral_prompt = f"Grok responded:\n{grok_text}\n\nAddress their points and strengthen your argument:"
+    
+    synthesis_prompt = f"""Original question: {prompt}
 
-        grok_claim = f"Mistral said: {mistral_text}\nRespond with your counter-argument:"
-        mistral_claim = f"Grok said: {grok_text}\nRespond with your counter-argument:"
+Complete debate transcript:
+{chr(10).join(debate_history)}
 
-    # Final synthesis by Grok
-    final_judge_str = await call_grok(
-        f"""Given the final debate, combine the strongest points from both models.
+Your task: Synthesize the BEST possible answer by:
+1. Extracting strongest evidence and reasoning from both sides
+2. Resolving contradictions by evaluating quality of arguments
+3. Identifying where models agree (likely correct) vs disagree (requires nuance)
+4. Providing actionable, clear conclusions
 
-Grok Final: {grok_text}
-Mistral Final: {mistral_text}
+Be direct, precise, and cut through noise. No hedging."""
 
-Provide one unified final answer.
-"""
-    )
+    final_str = await call_grok(synthesis_prompt, "You are an expert synthesizer. Produce the most accurate, useful answer possible.")
+    final_resp = json.loads(final_str)
+    
+    if "choices" not in final_resp:
+        return f"Synthesis error: {final_resp}"
+    
+    return final_resp["choices"][0]["message"]["content"]
 
-    final_judge = json.loads(final_judge_str)
-
-    if "choices" not in final_judge:
-        return f"Final Judge API Error:\n{final_judge}"
-
-    final_text = final_judge["choices"][0]["message"]["content"]
-
-    return f"""
-=== LLM Debate Complete ===
-
-Grok Final Answer:
-{grok_text}
-
-Mistral Final Answer:
-{mistral_text}
-
-=== Synthesized Final Answer ===
-{final_text}
-"""
-
-# -------------------------------
-# Start MCP Server
-# -------------------------------
 def main():
     if not API_KEY:
-        raise ValueError("Missing OPENROUTER_API_KEY environment variable!")
+        raise ValueError("Missing OPENROUTER_API_KEY")
     mcp.run(transport="stdio")
 
 if __name__ == "__main__":
